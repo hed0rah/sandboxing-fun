@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# check -- what can this kernel actually sandbox, and what is blocking you?
+#
+#   ./check
+#
+# Answers the question you hit the first time a sandbox refuses to start on a
+# machine where it worked last week. Every line reports a fact and, when the
+# answer is no, the reason and the fix.
+#
+# The motivating case: ubuntu 23.10+ ships
+# kernel.apparmor_restrict_unprivileged_userns=1, so bwrap dies with
+# "setting up uid map: Permission denied" and no hint about why.
+
+set -u
+G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'
+ok(){   printf "  ${G}yes${N}  %-34s %s\n" "$1" "${2-}"; }
+no(){   printf "  ${R}no${N}   %-34s %s\n" "$1" "${2-}"; }
+warn(){ printf "  ${Y}~${N}    %-34s %s\n" "$1" "${2-}"; }
+hdr(){  printf "\n${D}%s${N}\n" "$1"; }
+fix(){  printf "       ${D}fix: %s${N}\n" "$1"; }
+
+printf "kernel %s   %s\n" "$(uname -r)" "$( . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" )"
+
+hdr "namespaces (what a process can see)"
+for ns in user mnt pid net ipc uts cgroup time; do
+  if [ -e "/proc/self/ns/$ns" ]; then ok "$ns namespace" "$(readlink /proc/self/ns/$ns)"
+  else no "$ns namespace" "not compiled in"; fi
+done
+
+hdr "unprivileged user namespaces (the keystone)"
+# without this, every other namespace needs root, which defeats the purpose.
+if unshare --user --map-root-user true 2>/dev/null; then
+  ok "unprivileged userns" "you can sandbox without root"
+else
+  no "unprivileged userns" "$(unshare --user --map-root-user true 2>&1 | head -1)"
+  v=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "")
+  if [ "$v" = "1" ]; then
+    printf "       ${D}cause: apparmor_restrict_unprivileged_userns=1 (ubuntu 23.10+)${N}\n"
+    fix "per-binary apparmor profile granting 'userns' -- see docs/apparmor.md"
+    fix "or, blunt and system-wide: sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+  fi
+  v=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo "")
+  [ "$v" = "0" ] && fix "sysctl -w kernel.unprivileged_userns_clone=1 (debian-family knob)"
+  v=$(sysctl -n user.max_user_namespaces 2>/dev/null || echo "")
+  [ "$v" = "0" ] && fix "sysctl -w user.max_user_namespaces=10000 (currently 0 = disabled)"
+fi
+
+hdr "seccomp (which syscalls it may call)"
+s=$(grep -i '^Seccomp:' /proc/self/status 2>/dev/null | awk '{print $2}')
+if [ -n "${s:-}" ]; then
+  ok "seccomp supported" "this process mode=$s (0=off 1=strict 2=filter)"
+else
+  no "seccomp" "CONFIG_SECCOMP_FILTER missing"
+fi
+if grep -qi 'seccomp' /proc/self/status 2>/dev/null; then
+  ok "no_new_privs settable" "required before unprivileged seccomp/landlock"
+fi
+
+hdr "landlock (unprivileged path policy)"
+# ABI version is the only honest capability probe; the syscall is the interface.
+if command -v python3 >/dev/null 2>&1; then
+  abi=$(python3 - <<'PY' 2>/dev/null
+import ctypes
+try:
+    v = ctypes.CDLL(None, use_errno=True).syscall(444, None, 0, 1)  # landlock_create_ruleset
+    print(v if v > 0 else 0)
+except Exception:
+    print(-1)
+PY
+)
+  case "${abi:-0}" in
+    -1|0) no "landlock" "not supported by this kernel (needs 5.13+, enabled)" ;;
+    *)    ok "landlock" "ABI v$abi" ;;
+  esac
+else
+  warn "landlock" "no python3 to probe with"
+fi
+
+hdr "cgroups v2 (resource limits)"
+if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  ok "cgroup v2 unified" "$(cat /sys/fs/cgroup/cgroup.controllers)"
+  d=$(cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cgroup.controllers 2>/dev/null || echo "")
+  [ -n "$d" ] && ok "delegated to your user" "$d" \
+              || warn "delegation" "no controllers delegated; use systemd-run --user"
+else
+  no "cgroup v2" "legacy v1 hierarchy or not mounted"
+fi
+
+hdr "tools present"
+for t in bwrap unshare nsenter firejail nsjail podman docker systemd-run setpriv capsh; do
+  p=$(command -v "$t" 2>/dev/null) && ok "$t" "$p" || no "$t" ""
+done
+
+hdr "bwrap end to end"
+if command -v bwrap >/dev/null 2>&1; then
+  if out=$(bwrap --unshare-all --ro-bind /usr /usr --ro-bind /lib /lib \
+                 --ro-bind /lib64 /lib64 /usr/bin/id 2>&1); then
+    ok "bwrap unprivileged" "$out"
+  else
+    no "bwrap unprivileged" "$(echo "$out" | head -1)"
+    echo "$out" | grep -q 'uid map' && fix "see the userns section above -- this is that same block"
+  fi
+fi
+
+hdr "apparmor / selinux"
+if command -v aa-enabled >/dev/null 2>&1 && aa-enabled >/dev/null 2>&1; then
+  ok "apparmor" "enabled"
+  [ -e /etc/apparmor.d/bwrap ] && ok "bwrap profile" "/etc/apparmor.d/bwrap present" \
+                              || warn "bwrap profile" "absent -- the usual cause of uid-map failures"
+else
+  warn "apparmor" "not enabled"
+fi
+command -v getenforce >/dev/null 2>&1 && ok "selinux" "$(getenforce)"
+
+printf "\n${D}legend: this is a capability report, not a security score. a 'yes' means the\nprimitive is available, not that anything is using it.${N}\n"

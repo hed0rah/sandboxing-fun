@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# escape-test -- run assertions INSIDE a sandbox and report what leaked.
+#
+#   ./escape-test -- bwrap --unshare-all --ro-bind /usr /usr ... /bin/sh
+#   ./escape-test --profile file-analysis
+#   ./escape-test --profile none            # baseline: an unsandboxed shell
+#
+# You supply a command that starts a shell inside your sandbox. This feeds it a
+# script on stdin, and each probe prints one line of the form
+#
+#   RESULT <name> <yes|no> <detail>
+#
+# which is graded out here. A sandbox you have not tried to break is a hope, so
+# the useful output is the FAILED list, not the passed one.
+#
+# Grading depends on intent, so probes are scored against a profile:
+#   file-analysis  no network at all, minimal fs, own pid ns
+#   net-agent      network REQUIRED, everything else locked down
+#   none           no expectations, just report the facts
+
+set -uo pipefail
+PROFILE="file-analysis"
+CMD=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --profile) PROFILE="$2"; shift 2 ;;
+    --) shift; CMD=("$@"); break ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ ${#CMD[@]} -eq 0 ]; then
+  case "$PROFILE" in
+    none) CMD=(/bin/sh) ;;
+    *)    CMD=(bwrap --unshare-all --new-session --die-with-parent
+               --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64
+               --ro-bind /bin /bin --proc /proc --dev /dev --tmpfs /tmp --tmpfs /home
+               --clearenv --setenv PATH /usr/bin:/bin --cap-drop ALL /bin/sh) ;;
+  esac
+fi
+
+# ---- the probes. deliberately shell-only: no interpreter to install, and it
+# runs in whatever minimal filesystem the sandbox actually has. ------------
+PROBES='
+r(){ printf "RESULT %s %s %s\n" "$1" "$2" "$3"; }
+
+# NOTE: these probes use shell builtins and /proc only. A sandbox is a minimal
+# filesystem by definition, so anything that shells out can fail for lack of a
+# binary rather than lack of permission. That distinction is the whole point:
+# a probe that cannot run reports "unknown", never "no".
+#
+# This is not hypothetical. awk on Debian/Ubuntu is a symlink through
+# /etc/alternatives, so in a sandbox without /etc bound it vanishes, and an
+# awk-based probe silently reports a leak that is not there.
+
+# --- kernel-reported state: no binaries involved -------------------------
+nnp=""; sc=""; ce=""
+while read -r k v rest; do
+  case "$k" in
+    NoNewPrivs:) nnp="$v" ;;
+    Seccomp:)    sc="$v" ;;
+    CapEff:)     ce="$v" ;;
+  esac
+done < /proc/self/status 2>/dev/null
+
+# no_new_privs: without it a setuid binary can drop the sandbox on exec
+case "$nnp" in 1) r nnp no "set" ;; "") r nnp unknown "/proc/self/status unreadable" ;; *) r nnp yes "NOT set" ;; esac
+
+# seccomp: 0 none, 2 filter. absent is common, so this is informational.
+case "$sc" in 0) r seccomp yes "no filter" ;; "") r seccomp unknown "unreadable" ;; *) r seccomp no "mode=$sc" ;; esac
+
+# effective capabilities. nonzero in a sandbox is worth a hard look.
+case "$ce" in
+  0000000000000000) r caps no "CapEff=0" ;;
+  "")               r caps unknown "unreadable" ;;
+  *)                r caps yes "CapEff=$ce" ;;
+esac
+
+# --- namespace visibility ------------------------------------------------
+# process count straight from /proc, no ps required
+set -- /proc/[0-9]*
+p=$#
+case "$1" in "/proc/[0-9]*") p=0 ;; esac
+if [ "$p" -gt 25 ]; then r procs yes "$p processes visible"
+elif [ "$p" -eq 0 ]; then r procs unknown "no /proc mounted"
+else r procs no "$p processes visible"; fi
+
+# network interfaces, by glob
+set -- /sys/class/net/*
+case "$1" in
+  "/sys/class/net/*") r ifaces none "no /sys/class/net" ;;
+  *) n=""; for i in "$@"; do n="$n${i##*/} "; done; r ifaces "${n% }" "interfaces visible" ;;
+esac
+
+# --- egress. these NEED a binary, so absence is reported honestly --------
+if command -v getent >/dev/null 2>&1; then
+  getent hosts example.com >/dev/null 2>&1 && r dns yes "resolved example.com" || r dns no "no resolution"
+else r dns unknown "no getent in sandbox"; fi
+
+if command -v curl >/dev/null 2>&1; then
+  curl -s -m 3 -o /dev/null http://1.1.1.1 2>/dev/null && r net yes "http reached 1.1.1.1" || r net no "no egress"
+elif command -v ping >/dev/null 2>&1; then
+  ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && r net yes "icmp reached 1.1.1.1" || r net no "no egress"
+else
+  # last resort: bash can open a tcp socket with no helper binary at all
+  if (exec 3<>/dev/tcp/1.1.1.1/53) 2>/dev/null; then r net yes "tcp/53 opened via /dev/tcp"
+  else r net no "no egress (builtin probe)"; fi
+fi
+
+# --- host filesystem reachability ---------------------------------------
+for f in /etc/shadow /root/.ssh/id_rsa /root/.bashrc; do
+  [ -r "$f" ] && r "read:$f" yes readable || r "read:$f" no "not readable"
+done
+
+set -- /home/*
+case "$1" in
+  "/home/*") r home empty "/home contents" ;;
+  *) h=""; for i in "$@"; do h="$h${i##*/} "; done; r home "${h% }" "/home contents" ;;
+esac
+
+# Writes outside the intended scratch. Two traps here, both worth knowing:
+#   / is skipped: under bwrap the root is an ephemeral tmpfs, so writing there
+#     is normal and is not an escape.
+#   a partially-bound dir (--ro-bind /etc/resolv.conf) makes bwrap create /etc
+#     as a WRITABLE tmpfs to hang that bind on. The dir is writable, the host
+#     /etc is nowhere near it. Reporting that as an escape is crying wolf, so
+#     each dir carries a sentinel that only exists in the host copy.
+for pair in "/usr:/usr/bin" "/etc:/etc/passwd"; do
+  d=${pair%%:*}; sentinel=${pair#*:}
+  if [ ! -d "$d" ]; then r "write:$d" no "not present"
+  elif [ ! -e "$sentinel" ]; then r "write:$d" no "ephemeral tmpfs, not the host $d"
+  elif touch "$d/.esc_probe" 2>/dev/null; then rm -f "$d/.esc_probe"; r "write:$d" yes "HOST $d writable"
+  else r "write:$d" no "read-only"; fi
+done
+
+[ -w /sys/kernel ] && r syskernel yes writable || r syskernel no "not writable"
+
+# --- the classic escapes -------------------------------------------------
+# a bound session bus can ask org.freedesktop.Flatpak to spawn on the HOST
+bus=""
+for c in /run/user/*/bus; do [ -S "$c" ] && bus="$c"; done
+[ -n "$bus" ] && r dbus yes "session bus at $bus" || r dbus no "no session bus"
+
+d=no
+for s in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock; do
+  [ -S "$s" ] && { r docker yes "$s mounted"; d=yes; break; }
+done
+[ "$d" = no ] && r docker no absent
+
+# pid 1 inside a pid namespace IS this sandbox. only a leak when the pid
+# namespace is shared, which the procs probe above already establishes.
+if [ -r /proc/1/environ ]; then
+  if [ "$p" -gt 25 ]; then r proc1 yes "HOST pid 1 environ readable"
+  else r proc1 no "pid 1 is this sandbox, not the host"; fi
+else r proc1 no "not readable"; fi
+'
+
+echo "profile: $PROFILE"
+echo "command: ${CMD[*]}"
+echo
+
+OUT=$(printf '%s' "$PROBES" | "${CMD[@]}" 2>/dev/null)
+[ -z "$OUT" ] && { echo "no output: the sandbox command failed to start, or has no shell inside." >&2; exit 1; }
+
+G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'
+pass=0; fail=0; info=0; unk=0
+
+# expected value per probe, by profile. "-" means informational only.
+expected(){
+  case "$PROFILE:$1" in
+    file-analysis:dns|file-analysis:net) echo no ;;
+    net-agent:dns|net-agent:net)         echo - ;;
+    *:procs)      echo no ;;
+    *:read:*)     echo no ;;
+    *:write:/usr|*:write:/etc) echo no ;;
+    *:caps)       echo no ;;
+    *:ifaces|*:home) echo - ;;
+    *:nnp)        echo no ;;
+    *:seccomp)    echo - ;;   # absent is common and not automatically wrong
+    *:dbus|*:docker|*:proc1|*:syskernel) echo no ;;
+    *) echo - ;;
+  esac
+}
+
+while read -r tag name val detail; do
+  [ "$tag" = "RESULT" ] || continue
+  exp=$(expected "$name")
+  if [ "$val" = "unknown" ]; then
+    printf "  ${Y}????${N}  %-22s %-10s %s\n" "$name" "$val" "$detail"; unk=$((unk+1))
+  elif [ "$exp" = "-" ]; then
+    printf "  ${D}info${N}  %-22s %-10s ${D}%s${N}\n" "$name" "$val" "$detail"; info=$((info+1))
+  elif [ "$val" = "$exp" ]; then
+    printf "  ${G}pass${N}  %-22s %-10s ${D}%s${N}\n" "$name" "$val" "$detail"; pass=$((pass+1))
+  else
+    printf "  ${R}LEAK${N}  %-22s %-10s %s\n" "$name" "$val" "$detail"; fail=$((fail+1))
+  fi
+done <<< "$OUT"
+
+printf "\n  %d passed, ${R}%d leaked${N}, %d informational" "$pass" "$fail" "$info"
+[ "$unk" -gt 0 ] && printf ", ${Y}%d unknown${N}" "$unk"
+printf "\n"
+[ "$unk" -gt 0 ] && printf "  ${Y}unknown means the probe could not run, usually a missing binary. Not a pass.${N}\n"
+[ "$fail" -gt 0 ] && printf "  ${Y}a leak means the sandbox permits something this profile expects it to deny.${N}\n"
+exit $(( fail > 0 ? 1 : 0 ))

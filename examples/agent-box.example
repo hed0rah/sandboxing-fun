@@ -1,0 +1,68 @@
+#!/bin/sh
+# agent-box -- run a network-facing agent inside a bwrap sandbox, as its own uid.
+#
+#   agent-box [--dir <workdir>] [agent args...]
+#
+# Two layers, because they cover different things:
+#
+#   sudo -u agent   separate uid. cannot read your home, keys, or repos even
+#                  if the sandbox itself were bypassed.
+#   bwrap          mount + pid + ipc + uts namespaces. only /home/agent is
+#                  writable, only what is bound is visible, and /proc shows
+#                  nothing but this process tree.
+#
+# NETWORK IS DELIBERATELY LEFT ON (--share-net). agent needs LLM APIs and
+# search providers. That inverts the usual threat model: we cannot stop it
+# talking out, so instead we make sure there is nothing worth stealing in reach.
+#
+# Requires the bwrap apparmor profile (/etc/apparmor.d/bwrap) on ubuntu 24.04+,
+# which grants the userns that kernel.apparmor_restrict_unprivileged_userns
+# otherwise denies. Without it bwrap fails with "setting up uid map".
+
+set -eu
+
+AGENT_HOME=/home/agent
+WORK_DIR="$AGENT_HOME"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dir) WORK_DIR="$2"; shift 2 ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    *) break ;;
+  esac
+done
+
+# the api key lives at /home/agent/agent/.api.key, inside the bound home,
+# so agent reads it itself. nothing to plumb, and it never enters the process
+# environment (where it would show up in /proc/<pid>/environ). warn if missing.
+KEYFILE="$AGENT_HOME/agent/.api.key"
+sudo -n test -s "$KEYFILE" 2>/dev/null || \
+  echo "agent-box: warning, $KEYFILE missing or empty" >&2
+
+exec sudo -u agent -H env -i \
+  bwrap \
+    --unshare-all --share-net          `# everything isolated EXCEPT network` \
+    --die-with-parent \
+    --new-session                      `# no TIOCSTI injection into the parent tty` \
+    --ro-bind /usr /usr \
+    --ro-bind /lib /lib \
+    --ro-bind /lib64 /lib64 \
+    --ro-bind /bin /bin \
+    --ro-bind /etc/ssl /etc/ssl        `# tls trust store, or every api call fails` \
+    --ro-bind /etc/ca-certificates /etc/ca-certificates \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
+    --ro-bind /etc/hosts /etc/hosts \
+    --ro-bind /etc/passwd /etc/passwd \
+    --bind "$AGENT_HOME" "$AGENT_HOME"   `# the ONLY writable path` \
+    --proc /proc \
+    --dev /dev \
+    --tmpfs /tmp \
+    --chdir "$WORK_DIR" \
+    --setenv HOME "$AGENT_HOME" \
+    --setenv PATH "$AGENT_HOME/.local/bin:/usr/bin:/bin" \
+    --setenv TERM "${TERM:-xterm-256color}" \
+    --setenv AGENT_SESSION_DIR "$AGENT_HOME/sessions" \
+    --setenv AGENT_MEMORY_DIR "$AGENT_HOME/.agent/memory" \
+    --cap-drop ALL \
+    "$AGENT_HOME/.local/bin/agent" "$@"
