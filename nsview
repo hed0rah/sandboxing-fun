@@ -1,0 +1,111 @@
+#!/bin/sh
+# nsview -- which namespaces is a process actually in, and are they its own?
+#
+#   ./nsview                 # this process
+#   ./nsview 1               # pid 1
+#   ./nsview --compare 1 self
+#   bwrap ... ./nsview       # run it INSIDE a sandbox to prove isolation
+#
+# Every /proc/<pid>/ns/<type> is a symlink reading "type:[inode]". Two processes
+# share a namespace exactly when the inode matches. That is the whole mechanism.
+#
+# The useful part: the kernel gives the INITIAL namespace of each type a fixed,
+# documented inode number (include/linux/ns_common.h, exposed via nsfs). So a
+# process can determine on its own, with nothing to compare against, whether it
+# sits in the host's original namespace or in one somebody created for it.
+#
+#   MNT_NS_INIT_INO     0xEFFFFFF8   4026531832
+#   NET_NS_INIT_INO     0xEFFFFFF9   4026531833
+#   TIME_NS_INIT_INO    0xEFFFFFFA   4026531834
+#   CGROUP_NS_INIT_INO  0xEFFFFFFB   4026531835
+#   PID_NS_INIT_INO     0xEFFFFFFC   4026531836
+#   USER_NS_INIT_INO    0xEFFFFFFD   4026531837
+#   UTS_NS_INIT_INO     0xEFFFFFFE   4026531838
+#   IPC_NS_INIT_INO     0xEFFFFFFF   4026531839
+#
+# This matters because counting processes in /proc is a guess, and guesses are
+# how a sandbox audit reports a pass it did not earn. An inode comparison is a
+# fact. Caveat worth knowing: the mnt and net constants were only formalised in
+# recent kernels; on older ones those two initial inodes were allocated
+# dynamically from the same descending pool, so a match is strong evidence and a
+# miss is not proof. The other six have been stable for many years.
+
+set -u
+
+INIT_mnt=4026531832
+INIT_net=4026531833
+INIT_time=4026531834
+INIT_cgroup=4026531835
+INIT_pid=4026531836
+INIT_user=4026531837
+INIT_uts=4026531838
+INIT_ipc=4026531839
+
+TYPES='mnt pid net user uts ipc cgroup time'
+
+# read the inode out of "pid:[4026531836]" using only parameter expansion,
+# because readlink is not guaranteed present in a minimal sandbox and this
+# has to work where nothing is installed.
+# NOTE: no redirect here goes to /dev/null. A sandbox need not have a /dev at
+# all, and `2>/dev/null` FAILS when the device node is missing, which takes the
+# whole command down with it. The first version of this tool reported "namespace
+# not present" for all eight inside a bwrap sandbox with no --dev, i.e. a clean
+# bill of health produced entirely by broken redirects. `2>&-` closes the
+# descriptor instead and needs nothing mounted.
+ns_ino() { # $1=pid $2=type -> inode, or empty
+  _l=/proc/$1/ns/$2
+  # -L tests the symlink itself. These are nsfs magic links, so avoid following.
+  [ -L "$_l" ] || return 1
+  _rl=$(command -v readlink 2>&-)
+  if [ -n "$_rl" ]; then _v=$(readlink "$_l" 2>&-)
+  else _v=$(ls -l "$_l" 2>&-); _v=${_v#*-> }; fi
+  [ -n "$_v" ] || return 1
+  _v=${_v#*[}; _v=${_v%]}
+  printf '%s' "$_v"
+}
+
+report() {
+  _p=$1
+  [ -d "/proc/$_p" ] || { echo "nsview: no such pid: $_p" >&2; exit 1; }
+  _nm=""
+  while read -r _k _v2 _rest; do [ "$_k" = "Name:" ] && { _nm=$_v2; break; }; done < "/proc/$_p/status"
+  printf 'pid %s (%s)\n\n' "$_p" "${_nm:-?}"
+  printf '  %-8s %-12s %s\n' TYPE INODE STATE
+  _own=0; _tot=0
+  for t in $TYPES; do
+    _i=$(ns_ino "$_p" "$t") || { printf '  %-8s %-12s %s\n' "$t" "-" "not present in this kernel"; continue; }
+    _tot=$((_tot + 1))
+    eval "_init=\${INIT_$t}"
+    if [ "$_i" = "$_init" ]; then
+      printf '  %-8s %-12s %s\n' "$t" "$_i" "INITIAL (the host's own)"
+    else
+      printf '  %-8s %-12s %s\n' "$t" "$_i" "unshared"
+      _own=$((_own + 1))
+    fi
+  done
+  printf '\n  %d of %d namespaces are not the host initial namespace.\n' "$_own" "$_tot"
+  # the two that carry the most weight for a sandbox
+  _pi=$(ns_ino "$_p" pid); _ui=$(ns_ino "$_p" user); _ni=$(ns_ino "$_p" net)
+  [ "${_pi:-}" = "$INIT_pid" ] && printf '  pid namespace is the host one, so /proc exposes every host process.\n'
+  [ "${_ni:-}" = "$INIT_net" ] && printf '  net namespace is the host one, so the host network is fully reachable.\n'
+  [ "${_ui:-}" = "$INIT_user" ] && printf '  user namespace is the host one, so uid 0 here is uid 0 there.\n'
+}
+
+compare() {
+  _a=$1; _b=$2
+  printf '  %-8s %-13s %-13s %s\n' TYPE "pid $_a" "pid $_b" ''
+  for t in $TYPES; do
+    _x=$(ns_ino "$_a" "$t") || _x='-'
+    _y=$(ns_ino "$_b" "$t") || _y='-'
+    if [ "$_x" = "$_y" ]; then _s='SHARED'; else _s='separate'; fi
+    printf '  %-8s %-13s %-13s %s\n' "$t" "$_x" "$_y" "$_s"
+  done
+}
+
+case "${1:-}" in
+  -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+  --compare) [ $# -ge 3 ] || { echo "nsview: --compare needs two pids" >&2; exit 2; }
+             compare "$2" "$3" ;;
+  '')  report self ;;
+  *)   report "$1" ;;
+esac

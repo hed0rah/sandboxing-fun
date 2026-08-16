@@ -1,0 +1,161 @@
+#!/bin/sh
+# capdecode -- decode a process's capability sets from /proc, with no libcap.
+#
+#   ./capdecode              # this shell
+#   ./capdecode 1            # pid 1
+#   ./capdecode --hex 00000000a80425fb
+#   ./capdecode --all        # every pid holding a capability
+#
+# capsh(1) does this, but it lives in libcap2-bin / libcap-progs / libcap and is
+# absent from most minimal images, which is exactly where you are when you are
+# reading CapEff out of a container or a sandbox. This needs only /proc and a
+# POSIX shell, so it runs on busybox, Alpine, and any arch.
+#
+# Why the five sets matter, since only two get talked about:
+#   CapEff  what the kernel checks RIGHT NOW
+#   CapPrm  what it may move into Eff without help
+#   CapBnd  the ceiling on execve. THIS is the one that makes a drop stick.
+#   CapInh  what survives execve of a non-setuid binary
+#   CapAmb  Inh raised automatically on exec, so it crosses a non-setuid exec
+#
+# A sandbox reporting CapEff=0 while CapBnd is still full has dropped nothing
+# durable: a file with file-capabilities, or any setuid binary, can raise caps
+# back on the next execve unless no_new_privs is also set. Judge a sandbox by
+# Bnd and no_new_privs together, never by Eff alone.
+
+set -u
+
+# bit:name for caps 0..40. Kept inline on purpose: parsing the running kernel's
+# capability.h would make this depend on installed headers, which minimal images
+# do not carry. Unknown high bits print as cap_NN, so a newer kernel degrades to
+# a number rather than a wrong name.
+CAPS='chown dac_override dac_read_search fowner fsetid kill setgid setuid setpcap
+linux_immutable net_bind_service net_broadcast net_admin net_raw ipc_lock ipc_owner
+sys_module sys_rawio sys_chroot sys_ptrace sys_pacct sys_admin sys_boot sys_nice
+sys_resource sys_time sys_tty_config mknod lease audit_write audit_control setfcap
+mac_override mac_admin syslog wake_alarm block_suspend audit_read perfmon bpf
+checkpoint_restore'
+
+# Capabilities that are root, or a short walk to it. Holding any of these means
+# the other restrictions are decoration.
+#   sys_admin      mount, pivot_root, a large fraction of all ioctls
+#   sys_module     load a kernel module. game over, by definition
+#   sys_rawio      /dev/mem, ioperm. read and write kernel memory
+#   sys_ptrace     attach to any process and read its memory
+#   dac_read_search / dac_override   bypass file permission checks
+#   setuid/setgid/setpcap   become another user, or edit capability sets
+#   bpf / perfmon  load BPF, read arbitrary kernel state
+#   checkpoint_restore  write another process's memory map
+#   mknod          create a block device node for the host disk, then read it
+#   mac_admin/mac_override   edit or bypass the LSM that was containing you
+#   sys_boot       reboot the host
+#   syslog         read kernel addresses, defeating KASLR
+DANGER=' sys_admin sys_module sys_rawio sys_ptrace dac_read_search dac_override
+setuid setgid setpcap bpf perfmon checkpoint_restore mknod mac_admin mac_override
+sys_boot syslog net_admin net_raw '
+
+# POSIX sh has no `local`, so every function variable is global. capname is
+# called from inside decode's loop, so a bare `i` here silently destroys
+# decode's nibble counter and decoding stops at the first 4-bit boundary. Hence
+# the _cn_ prefix. This is the single most common way a pure-sh tool breaks.
+capname() { # $1 = bit number
+  _cn_i=0
+  for _cn_n in $CAPS; do
+    [ "$_cn_i" -eq "$1" ] && { printf 'cap_%s' "$_cn_n"; return; }
+    _cn_i=$((_cn_i + 1))
+  done
+  printf 'cap_%s' "$1"   # beyond this table's knowledge, report the bit honestly
+}
+
+# decode <hexmask> -> prints one "cap_x" per set bit
+decode() {
+  mask=$1
+  # strip a leading 0x if present, then normalise. POSIX $(()) handles 0x.
+  case "$mask" in 0x*|0X*) ;; *) mask=0x$mask ;; esac
+  # A 64-bit mask can exceed what some shells hold in a signed intmax, so walk
+  # the hex string nibble by nibble instead of doing 64-bit arithmetic. This is
+  # the portable path: busybox ash and dash both handle it.
+  h=${mask#0[xX]}
+  len=${#h}
+  bit=0
+  i=$len
+  while [ "$i" -gt 0 ]; do
+    nib=$(printf '%s' "$h" | cut -c "$i")
+    v=$((0x$nib))
+    b=0
+    while [ "$b" -lt 4 ]; do
+      if [ $(( (v >> b) & 1 )) -eq 1 ]; then capname $((bit + b)); printf '\n'; fi
+      b=$((b + 1))
+    done
+    bit=$((bit + 4))
+    i=$((i - 1))
+  done
+}
+
+# is this capability in the escape-grade list?
+DANGER=" $(echo $DANGER) "   # collapse embedded newlines so " name " matches
+
+is_danger() { case "$DANGER" in *" ${1#cap_} "*) return 0 ;; esac; return 1; }
+
+show_set() { # $1 = label, $2 = hex
+  printf '  %-8s %s' "$1" "$2"
+  set -- $(decode "$2")
+  if [ $# -eq 0 ]; then printf '   (empty)\n'; return; fi
+  printf '\n'
+  for c in "$@"; do
+    if is_danger "$c"; then printf '             %-24s <-- escape-grade\n' "$c"
+    else printf '             %s\n' "$c"; fi
+  done
+}
+
+report_pid() {
+  pid=$1
+  st=/proc/$pid/status
+  [ -r "$st" ] || { echo "capdecode: cannot read $st" >&2; return 1; }
+  nm=""; eff=""; prm=""; inh=""; bnd=""; amb=""; nnp=""
+  while read -r k v rest; do
+    case "$k" in
+      Name:)      nm=$v ;;
+      CapEff:)    eff=$v ;;
+      CapPrm:)    prm=$v ;;
+      CapInh:)    inh=$v ;;
+      CapBnd:)    bnd=$v ;;
+      CapAmb:)    amb=$v ;;
+      NoNewPrivs:) nnp=$v ;;
+    esac
+  done < "$st"
+
+  printf 'pid %s (%s)\n' "$pid" "${nm:-?}"
+  show_set Eff "$eff"
+  show_set Prm "$prm"
+  show_set Inh "$inh"
+  show_set Bnd "$bnd"
+  show_set Amb "$amb"
+  printf '  %-8s %s\n' no_new_privs "${nnp:-unknown}"
+
+  # the verdict that Eff alone hides
+  if [ "$eff" = "0000000000000000" ] && [ -n "$bnd" ] && [ "$bnd" != "0000000000000000" ]; then
+    printf '\n  NOTE: Eff is empty but the bounding set is not. Caps can come back on\n'
+    printf '        execve via a file-capabilities or setuid binary'
+    if [ "${nnp:-0}" = "1" ]; then printf ', though no_new_privs\n        is set, which blocks that path.\n'
+    else printf '.\n        no_new_privs is NOT set, so that path is open.\n'; fi
+  fi
+}
+
+case "${1:-}" in
+  -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+  --hex) [ $# -ge 2 ] || { echo "capdecode: --hex needs a mask" >&2; exit 2; }
+         show_set mask "$2"; exit 0 ;;
+  --all)
+    for d in /proc/[0-9]*; do
+      p=${d#/proc/}
+      [ -r "$d/status" ] || continue
+      e=""; while read -r k v rest; do [ "$k" = CapEff: ] && { e=$v; break; }; done < "$d/status"
+      [ -n "$e" ] && [ "$e" != "0000000000000000" ] || continue
+      n=""; while read -r k v rest; do [ "$k" = Name: ] && { n=$v; break; }; done < "$d/status"
+      printf '%-8s %-20s %s\n' "$p" "$n" "$e"
+    done
+    exit 0 ;;
+  '') report_pid self ;;
+  *)  report_pid "$1" ;;
+esac

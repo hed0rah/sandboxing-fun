@@ -56,14 +56,17 @@ r(){ printf "RESULT %s %s %s\n" "$1" "$2" "$3"; }
 # awk-based probe silently reports a leak that is not there.
 
 # --- kernel-reported state: no binaries involved -------------------------
-nnp=""; sc=""; ce=""
+nnp=""; sc=""; ce=""; cp=""; cb=""; ca=""
 while read -r k v rest; do
   case "$k" in
     NoNewPrivs:) nnp="$v" ;;
     Seccomp:)    sc="$v" ;;
     CapEff:)     ce="$v" ;;
+    CapPrm:)     cp="$v" ;;
+    CapBnd:)     cb="$v" ;;
+    CapAmb:)     ca="$v" ;;
   esac
-done < /proc/self/status 2>/dev/null
+done < /proc/self/status
 
 # no_new_privs: without it a setuid binary can drop the sandbox on exec
 case "$nnp" in 1) r nnp no "set" ;; "") r nnp unknown "/proc/self/status unreadable" ;; *) r nnp yes "NOT set" ;; esac
@@ -71,28 +74,65 @@ case "$nnp" in 1) r nnp no "set" ;; "") r nnp unknown "/proc/self/status unreada
 # seccomp: 0 none, 2 filter. absent is common, so this is informational.
 case "$sc" in 0) r seccomp yes "no filter" ;; "") r seccomp unknown "unreadable" ;; *) r seccomp no "mode=$sc" ;; esac
 
-# effective capabilities. nonzero in a sandbox is worth a hard look.
-case "$ce" in
-  0000000000000000) r caps no "CapEff=0" ;;
-  "")               r caps unknown "unreadable" ;;
-  *)                r caps yes "CapEff=$ce" ;;
-esac
+# Capabilities, judged on four sets rather than CapEff alone. CapEff=0 says
+# nothing durable: with a full BOUNDING set and no_new_privs off, an execve of
+# any setuid-root or file-capability binary hands the caps straight back. A
+# probe that reads only Eff calls that sandbox clean.
+z=0000000000000000
+if [ -z "$ce" ]; then r caps unknown "/proc/self/status unreadable"
+elif [ "$ce" != "$z" ] || [ "$cp" != "$z" ] || [ "$ca" != "$z" ]; then
+  r caps yes "held Eff=$ce Prm=$cp Amb=$ca"
+elif [ "$cb" != "$z" ] && [ "$nnp" != "1" ]; then
+  r caps yes "CapEff=0 but CapBnd=$cb with no_new_privs off: regainable on exec"
+elif [ "$cb" != "$z" ]; then
+  r caps no "CapEff=0, CapBnd=$cb pinned by no_new_privs"
+else r caps no "all capability sets empty"; fi
 
 # --- namespace visibility ------------------------------------------------
-# process count straight from /proc, no ps required
+# Process isolation, decided by namespace inode rather than by counting.
+# The host initial pid namespace has a fixed inode, PID_NS_INIT_INO
+# 0xEFFFFFFC = 4026531836, on every Linux. Counting processes and calling
+# ">25" a shared namespace is a guess that fails BOTH ways: a minimal host or
+# one using hidepid shows few processes while sharing the host namespace, and
+# a busy sandbox of its own trips the threshold while being properly isolated.
 set -- /proc/[0-9]*
 p=$#
 case "$1" in "/proc/[0-9]*") p=0 ;; esac
-if [ "$p" -gt 25 ]; then r procs yes "$p processes visible"
-elif [ "$p" -eq 0 ]; then r procs unknown "no /proc mounted"
-else r procs no "$p processes visible"; fi
-
-# network interfaces, by glob
-set -- /sys/class/net/*
-case "$1" in
-  "/sys/class/net/*") r ifaces none "no /sys/class/net" ;;
-  *) n=""; for i in "$@"; do n="$n${i##*/} "; done; r ifaces "${n% }" "interfaces visible" ;;
+pidns=""
+if [ -L /proc/self/ns/pid ]; then
+  if command -v readlink >/dev/null 2>&1; then pidns=$(readlink /proc/self/ns/pid)
+  else pidns=$(ls -l /proc/self/ns/pid 2>&-); pidns=${pidns##*-> }; fi
+fi
+init1=""
+[ -r /proc/1/comm ] && read -r init1 < /proc/1/comm
+case "$pidns" in
+  "pid:[4026531836]") r procs yes "HOST initial pid ns, $p procs, pid1=$init1"; shared_pidns=1 ;;
+  pid:\[*\])         r procs no "own pid ns $pidns, $p procs"; shared_pidns=0 ;;
+  *) case "$init1" in
+       ""|init|systemd) r procs unknown "ns inode unreadable, pid1=$init1"; shared_pidns=1 ;;
+       *)               r procs no "own pid ns (pid1=$init1)"; shared_pidns=0 ;;
+     esac ;;
 esac
+
+# Network ISOLATION, which is not the same question as egress. A sandbox that
+# forgot --unshare-net shares the host netns and can bind host ports and see
+# host sockets; if egress happens to be down at test time, an egress-only probe
+# scores that clean.
+#
+# Read from /proc/net/dev, NOT /sys/class/net. sysfs net contents follow the
+# netns the sysfs instance was MOUNTED in, so a sandbox with a private netns
+# and the host /sys bound reports the host interface list from /sys while
+# /proc/net/dev correctly shows only lo.
+ifc=""
+if [ -r /proc/net/dev ]; then
+  while read -r dev rest; do
+    dev=${dev%:}
+    case "$dev" in Inter-*|face|"") continue ;; lo) continue ;; esac
+    ifc="$ifc$dev "
+  done < /proc/net/dev
+  [ -n "$ifc" ] && r netns yes "non-loopback interfaces: ${ifc% }" \
+                || r netns no "loopback-only netns"
+else r netns unknown "/proc/net/dev unreadable"; fi
 
 # --- egress. these NEED a binary, so absence is reported honestly --------
 if command -v getent >/dev/null 2>&1; then
@@ -104,9 +144,11 @@ if command -v curl >/dev/null 2>&1; then
 elif command -v ping >/dev/null 2>&1; then
   ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && r net yes "icmp reached 1.1.1.1" || r net no "no egress"
 else
-  # last resort: bash can open a tcp socket with no helper binary at all
-  if (exec 3<>/dev/tcp/1.1.1.1/53) 2>/dev/null; then r net yes "tcp/53 opened via /dev/tcp"
-  else r net no "no egress (builtin probe)"; fi
+  # No /dev/tcp fallback here: that is a bash feature and this script is fed to
+  # /bin/sh, which is dash on Debian and Ubuntu. The branch would always report
+  # "no egress" whether or not the network works, which is a fabricated pass.
+  # The netns probe above is the real isolation signal anyway.
+  r net unknown "no curl, ping or getent in sandbox"
 fi
 
 # --- host filesystem reachability ---------------------------------------
@@ -137,6 +179,23 @@ done
 
 [ -w /sys/kernel ] && r syskernel yes writable || r syskernel no "not writable"
 
+# Kernel surfaces that are a direct escape when writable from a sandbox.
+# core_pattern is the classic one: pipe a crash handler to your own binary and
+# the kernel runs it on the HOST as root the next time anything segfaults.
+# release_agent is the cgroup-v1 equivalent and is simply absent under pure v2,
+# so "absent" there is expected rather than a finding.
+for f in /proc/sys/kernel/core_pattern /proc/sysrq-trigger \
+         /proc/sys/kernel/modprobe /sys/fs/cgroup/release_agent; do
+  [ -w "$f" ] && r "write:$f" yes "WRITABLE, escape vector" || r "write:$f" no "not writable or absent"
+done
+
+# raw memory and kernel-log devices. present means a --dev-bind of the host /dev
+for f in /dev/mem /dev/kmem /dev/port /dev/kmsg; do
+  if [ -e "$f" ]; then
+    [ -r "$f" ] && r "dev:$f" yes "present and readable" || r "dev:$f" yes present
+  else r "dev:$f" no absent; fi
+done
+
 # --- the classic escapes -------------------------------------------------
 # a bound session bus can ask org.freedesktop.Flatpak to spawn on the HOST
 bus=""
@@ -152,7 +211,7 @@ done
 # pid 1 inside a pid namespace IS this sandbox. only a leak when the pid
 # namespace is shared, which the procs probe above already establishes.
 if [ -r /proc/1/environ ]; then
-  if [ "$p" -gt 25 ]; then r proc1 yes "HOST pid 1 environ readable"
+  if [ "$shared_pidns" = "1" ]; then r proc1 yes "HOST pid 1 environ readable"
   else r proc1 no "pid 1 is this sandbox, not the host"; fi
 else r proc1 no "not readable"; fi
 '
@@ -169,6 +228,8 @@ pass=0; fail=0; info=0; unk=0
 
 # expected value per probe, by profile. "-" means informational only.
 expected(){
+  # `none` grades nothing. It exists to dump facts about an unknown sandbox.
+  [ "$PROFILE" = none ] && { echo -; return; }
   case "$PROFILE:$1" in
     file-analysis:dns|file-analysis:net) echo no ;;
     net-agent:dns|net-agent:net)         echo - ;;
@@ -176,10 +237,13 @@ expected(){
     *:read:*)     echo no ;;
     *:write:/usr|*:write:/etc) echo no ;;
     *:caps)       echo no ;;
+    file-analysis:netns) echo no ;;
     *:ifaces|*:home) echo - ;;
     *:nnp)        echo no ;;
     *:seccomp)    echo - ;;   # absent is common and not automatically wrong
     *:dbus|*:docker|*:proc1|*:syskernel) echo no ;;
+    *:write:/proc*|*:write:/sys*) echo no ;;
+    *:dev:*)      echo no ;;
     *) echo - ;;
   esac
 }

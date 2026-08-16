@@ -58,6 +58,10 @@ static inline int ll_restrict_self(int fd, uint32_t flags) {
 }
 #endif
 
+#ifndef X32_SYSCALL_BIT
+#define X32_SYSCALL_BIT 0x40000000U
+#endif
+
 /* 1. no_new_privs: execve can never gain privileges from here on. */
 static int step_no_new_privs(void) {
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
@@ -71,11 +75,21 @@ static int step_no_new_privs(void) {
 /* 2. landlock: allow read+execute beneath one directory, deny the rest of the fs.
  *
  * The handled_access_fs set is what we take responsibility for; anything listed
- * there is DENIED unless a rule re-permits it. Access rights not listed are
- * untouched, which is why this program cannot restrict writes it never named.
+ * there is DENIED unless a rule re-permits it. Anything NOT listed is left
+ * entirely alone, so a handled set naming only reads and execs does not
+ * restrict writing by one byte. An earlier version of this file made exactly
+ * that mistake: it advertised "deny the rest of the fs" while
+ * `sandbox /usr /usr/bin/tee /tmp/x` cheerfully created /tmp/x.
+ *
+ * So handle every right the running kernel knows, then GRANT only read and
+ * execute beneath the one allowed path. Writes end up denied everywhere,
+ * including beneath that path.
  *
  * ABI versions matter: each kernel added rights, and asking for a right the
- * running kernel does not know is an error. Query the version and mask down.
+ * running kernel does not know fails the whole ruleset with EINVAL. Since this
+ * program fails closed, that would be an abort rather than a silent bypass,
+ * but it still has to be masked to run anywhere. v1 5.13, v2 adds REFER,
+ * v3 adds TRUNCATE, v5 adds IOCTL_DEV.
  */
 static int step_landlock(const char *allowed_path) {
 #ifndef HAVE_LANDLOCK
@@ -94,11 +108,30 @@ static int step_landlock(const char *allowed_path) {
 	}
 	printf("[+] landlock ABI v%d\n", abi);
 
+	/* everything ABI v1 defines */
+	uint64_t handled = LANDLOCK_ACCESS_FS_EXECUTE     | LANDLOCK_ACCESS_FS_WRITE_FILE |
+	                   LANDLOCK_ACCESS_FS_READ_FILE   | LANDLOCK_ACCESS_FS_READ_DIR   |
+	                   LANDLOCK_ACCESS_FS_REMOVE_DIR  | LANDLOCK_ACCESS_FS_REMOVE_FILE|
+	                   LANDLOCK_ACCESS_FS_MAKE_CHAR   | LANDLOCK_ACCESS_FS_MAKE_DIR   |
+	                   LANDLOCK_ACCESS_FS_MAKE_REG    | LANDLOCK_ACCESS_FS_MAKE_SOCK  |
+	                   LANDLOCK_ACCESS_FS_MAKE_FIFO   | LANDLOCK_ACCESS_FS_MAKE_BLOCK |
+	                   LANDLOCK_ACCESS_FS_MAKE_SYM;
+#ifdef LANDLOCK_ACCESS_FS_REFER
+	if (abi >= 2) handled |= LANDLOCK_ACCESS_FS_REFER;
+#endif
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+	if (abi >= 3) handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
+#endif
+#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
+	if (abi >= 5) handled |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+#endif
+
+	/* granted beneath allowed_path: read and execute only */
 	uint64_t rights = LANDLOCK_ACCESS_FS_READ_FILE |
 	                  LANDLOCK_ACCESS_FS_READ_DIR  |
 	                  LANDLOCK_ACCESS_FS_EXECUTE;
 
-	struct landlock_ruleset_attr rs = { .handled_access_fs = rights };
+	struct landlock_ruleset_attr rs = { .handled_access_fs = handled };
 	int rfd = ll_create_ruleset(&rs, sizeof(rs), 0);
 	if (rfd < 0) { perror("landlock_create_ruleset"); return -1; }
 
@@ -132,6 +165,13 @@ static int step_landlock(const char *allowed_path) {
  * check for you; hand-rolled filters must do it themselves, and forgetting is
  * the classic seccomp bug.
  *
+ * The arch check ALONE is still not enough on x86_64. The x32 ABI reports the
+ * very same AUDIT_ARCH_X86_64, but sets bit 30 (__X32_SYSCALL_BIT) in the
+ * syscall number. So x32 ptrace arrives as nr == 0x40000065, which equals none
+ * of the numbers below, falls past every comparison, and lands on RET_ALLOW.
+ * The whole denylist is walked around by issuing x32 calls. Reject the bit
+ * outright: nothing here has any business using x32.
+ *
  * Denylist here for brevity. A real policy is an allowlist with a default of
  * ERRNO(EPERM) rather than KILL: killing on an unlisted syscall means the next
  * glibc update that calls something new turns into a crash instead of a
@@ -145,6 +185,10 @@ static int step_seccomp(void) {
 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
 
 		BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+
+		/* x32 shares our arch value but tags nr with bit 30. Kill it. */
+		BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, X32_SYSCALL_BIT,        0, 1),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
 
 		/* process inspection / injection */
 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ptrace,            0, 1),

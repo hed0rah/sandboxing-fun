@@ -27,22 +27,92 @@ for ns in user mnt pid net ipc uts cgroup time; do
   else no "$ns namespace" "not compiled in"; fi
 done
 
+# Read sysctls straight from /proc. The sysctl(8) binary lives in /usr/sbin and
+# is off the PATH for unprivileged users on stock Debian, which silently skipped
+# every cause line below.
+kv(){ [ -r "/proc/sys/$1" ] && cat "/proc/sys/$1" || echo ""; }
+
+# bwrap end-to-end runs FIRST, because under a per-binary AppArmor policy the
+# answer to "is unprivileged userns available" is genuinely "depends on the
+# binary", and reporting a flat no while bwrap works is the worst kind of wrong.
+BW_OK=no; BW_ERR=""
+if command -v bwrap >/dev/null 2>&1; then
+  set --
+  for d in /usr /lib /lib64 /bin; do [ -e "$d" ] && set -- "$@" --ro-bind "$d" "$d"; done
+  if BW_OUT=$(bwrap --unshare-all "$@" /usr/bin/id 2>&1); then BW_OK=yes
+  else BW_ERR=$(echo "$BW_OUT" | head -1); fi
+fi
+
 hdr "unprivileged user namespaces (the keystone)"
 # without this, every other namespace needs root, which defeats the purpose.
-if unshare --user --map-root-user true 2>/dev/null; then
+if ! command -v unshare >/dev/null 2>&1; then
+  warn "unprivileged userns" "unshare(1) not installed, cannot probe directly"
+elif unshare --user --map-root-user true 2>/dev/null; then
   ok "unprivileged userns" "you can sandbox without root"
 else
-  no "unprivileged userns" "$(unshare --user --map-root-user true 2>&1 | head -1)"
-  v=$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "")
-  if [ "$v" = "1" ]; then
-    printf "       ${D}cause: apparmor_restrict_unprivileged_userns=1 (ubuntu 23.10+)${N}\n"
-    fix "per-binary apparmor profile granting 'userns' -- see docs/apparmor.md"
-    fix "or, blunt and system-wide: sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+  # TWO-STAGE probe. Which stage fails is the entire diagnosis, and the two
+  # have completely different causes:
+  #   clone stage   -> the syscall itself was refused: an outer container's
+  #                    seccomp profile, user.max_user_namespaces=0, or
+  #                    CONFIG_USER_NS=n
+  #   uid_map stage -> the namespace was created and writing the mapping was
+  #                    refused: an LSM capability denial, AppArmor or SELinux
+  if unshare --user true 2>/dev/null; then stage=uid_map; else stage=clone; fi
+  err=$(unshare --user --map-root-user true 2>&1 | head -1)
+
+  if [ "$BW_OK" = yes ]; then
+    warn "unprivileged userns" "PER-BINARY: denied for unprofiled binaries, allowed for bwrap"
+    printf "       ${D}unshare fails at the %s stage: %s${N}\n" "$stage" "$err"
+    printf "       ${D}but the bwrap end-to-end test below succeeds, so sandboxing works here.${N}\n"
+  else
+    no "unprivileged userns" "$err"
+    printf "       ${D}failing stage: %s${N}\n" "$stage"
   fi
-  v=$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || echo "")
-  [ "$v" = "0" ] && fix "sysctl -w kernel.unprivileged_userns_clone=1 (debian-family knob)"
-  v=$(sysctl -n user.max_user_namespaces 2>/dev/null || echo "")
-  [ "$v" = "0" ] && fix "sysctl -w user.max_user_namespaces=10000 (currently 0 = disabled)"
+
+  named=no
+  if [ "$stage" = clone ]; then
+    # an outer container's seccomp filter is the most common cause in practice,
+    # and on an ubuntu host the apparmor sysctl below reads 1 from the HOST,
+    # so checking it first would confidently misattribute the block.
+    sc=""; while read -r k v rest; do [ "$k" = "Seccomp:" ] && { sc=$v; break; }; done < /proc/self/status
+    if [ "${sc:-0}" = "2" ] && { [ -e /.dockerenv ] || [ -e /run/.containerenv ]; }; then
+      printf "       ${D}cause: seccomp filter of the OUTER container blocks clone(CLONE_NEWUSER)${N}\n"
+      fix "run the outer container with --security-opt seccomp=unconfined, or a profile allowing unshare"
+      named=yes
+    fi
+    v=$(kv user/max_user_namespaces)
+    if [ "$v" = "0" ]; then
+      printf "       ${D}cause: user.max_user_namespaces=0${N}\n"
+      fix "sysctl -w user.max_user_namespaces=10000 (per userns hierarchy, not global)"
+      named=yes
+    fi
+    if [ -r "/boot/config-$(uname -r)" ] && ! grep -q '^CONFIG_USER_NS=y' "/boot/config-$(uname -r)"; then
+      printf "       ${D}cause: CONFIG_USER_NS is not enabled in this kernel${N}\n"
+      fix "no runtime fix. a different kernel is the only option"
+      named=yes
+    fi
+    v=$(kv kernel/unprivileged_userns_clone)
+    if [ "$v" = "0" ]; then
+      printf "       ${D}cause: kernel.unprivileged_userns_clone=0 (debian-family patch)${N}\n"
+      fix "sysctl -w kernel.unprivileged_userns_clone=1"
+      named=yes
+    fi
+  else
+    v=$(kv kernel/apparmor_restrict_unprivileged_userns)
+    if [ "$v" = "1" ]; then
+      printf "       ${D}cause: apparmor_restrict_unprivileged_userns=1 (ubuntu 23.10+)${N}\n"
+      fix "per-binary apparmor profile granting 'userns'. narrowest fix, keeps the restriction for everything else"
+      fix "or, blunt and system-wide: sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+      named=yes
+    fi
+    if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
+      printf "       ${D}cause: SELinux is enforcing and may be denying the mapping${N}\n"
+      fix "check with: ausearch -m avc -ts recent   (or dmesg | grep -i avc)"
+      named=yes
+    fi
+  fi
+  [ "$named" = no ] && printf "       ${D}cause not identified. check dmesg and auditd for LSM denials.${N}\n"
+  printf "       ${D}note: sysctl changes above are not persistent; use /etc/sysctl.d/ to keep them.${N}\n"
 fi
 
 hdr "seccomp (which syscalls it may call)"
@@ -52,9 +122,15 @@ if [ -n "${s:-}" ]; then
 else
   no "seccomp" "CONFIG_SECCOMP_FILTER missing"
 fi
-if grep -qi 'seccomp' /proc/self/status 2>/dev/null; then
-  ok "no_new_privs settable" "required before unprivileged seccomp/landlock"
+# this used to re-test the seccomp condition, so it printed yes whenever the
+# line above did and never actually looked at no_new_privs.
+if grep -q '^NoNewPrivs:' /proc/self/status 2>/dev/null; then
+  ok "no_new_privs supported" "required before unprivileged seccomp/landlock"
+else
+  no "no_new_privs" "field absent: kernel too old for unprivileged seccomp/landlock"
 fi
+[ -r /proc/sys/kernel/seccomp/actions_avail ] && \
+  ok "seccomp filter actions" "$(cat /proc/sys/kernel/seccomp/actions_avail)"
 
 hdr "landlock (unprivileged path policy)"
 # ABI version is the only honest capability probe; the syscall is the interface.
@@ -76,12 +152,31 @@ else
   warn "landlock" "no python3 to probe with"
 fi
 
+hdr "capabilities"
+ce=""; cb=""
+while read -r k v rest; do
+  case "$k" in CapEff:) ce=$v ;; CapBnd:) cb=$v ;; esac
+done < /proc/self/status
+if [ -n "$ce" ]; then
+  ok "capability sets readable" "CapEff=$ce CapBnd=$cb"
+  [ "$cb" = "0000000000000000" ] && ok "bounding set" "empty: no caps regainable on exec" \
+    || warn "bounding set" "non-empty, so exec of a setuid/fcaps binary can regain caps unless no_new_privs is set"
+else
+  no "capabilities" "/proc/self/status has no Cap fields"
+fi
+
 hdr "cgroups v2 (resource limits)"
 if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
   ok "cgroup v2 unified" "$(cat /sys/fs/cgroup/cgroup.controllers)"
-  d=$(cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/cgroup.controllers 2>/dev/null || echo "")
-  [ -n "$d" ] && ok "delegated to your user" "$d" \
-              || warn "delegation" "no controllers delegated; use systemd-run --user"
+  # what matters is whether YOU can write your own cgroup, not what controllers
+  # are listed on a root-owned slice node.
+  mycg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup 2>/dev/null | head -1)
+  if [ -w "$mycg" ] || [ -w "$mycg/cgroup.subtree_control" ]; then
+    ok "delegated to your user" "writable: $mycg"
+  else
+    warn "delegation" "$mycg not writable, so limits need root or a delegating supervisor"
+    command -v systemd-run >/dev/null 2>&1 && fix "systemd-run --user --scope -p MemoryMax=512M -p TasksMax=64 ..."
+  fi
 else
   no "cgroup v2" "legacy v1 hierarchy or not mounted"
 fi
@@ -92,21 +187,26 @@ for t in bwrap unshare nsenter firejail nsjail podman docker systemd-run setpriv
 done
 
 hdr "bwrap end to end"
-if command -v bwrap >/dev/null 2>&1; then
-  if out=$(bwrap --unshare-all --ro-bind /usr /usr --ro-bind /lib /lib \
-                 --ro-bind /lib64 /lib64 /usr/bin/id 2>&1); then
-    ok "bwrap unprivileged" "$out"
-  else
-    no "bwrap unprivileged" "$(echo "$out" | head -1)"
-    echo "$out" | grep -q 'uid map' && fix "see the userns section above -- this is that same block"
-  fi
+if ! command -v bwrap >/dev/null 2>&1; then
+  warn "bwrap" "not installed"
+elif [ "$BW_OK" = yes ]; then
+  ok "bwrap unprivileged" "$BW_OUT"
+else
+  no "bwrap unprivileged" "$BW_ERR"
+  case "$BW_ERR" in *"uid map"*) fix "see the userns section above, this is that same block" ;; esac
 fi
 
 hdr "apparmor / selinux"
 if command -v aa-enabled >/dev/null 2>&1 && aa-enabled >/dev/null 2>&1; then
   ok "apparmor" "enabled"
-  [ -e /etc/apparmor.d/bwrap ] && ok "bwrap profile" "/etc/apparmor.d/bwrap present" \
-                              || warn "bwrap profile" "absent -- the usual cause of uid-map failures"
+  if [ -e /etc/apparmor.d/bwrap ]; then
+    # the file existing does not mean apparmor_parser ever loaded it, and the
+    # loaded-profile list needs root. cross-reference the e2e result instead.
+    if [ "$BW_OK" = yes ]; then ok "bwrap profile" "/etc/apparmor.d/bwrap present and bwrap works"
+    else warn "bwrap profile" "file present but bwrap still fails: profile may not be loaded (apparmor_parser -r)"; fi
+  else
+    warn "bwrap profile" "absent, the usual cause of uid-map failures on ubuntu 23.10+"
+  fi
 else
   warn "apparmor" "not enabled"
 fi

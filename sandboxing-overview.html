@@ -672,11 +672,12 @@ h3[id], h4[id], tr[id] { scroll-margin-top: 56px; }
 
   <div class="info-box danger">
     <strong>seccomp cannot dereference pointers</strong>
-    Arguments are visible as scalars only. The filter may not follow a <code>char *path</code>, because userspace could change that memory after the check and before the kernel uses it, a TOCTOU race. So <strong>"deny open() of /etc/shadow" is not expressible in seccomp</strong>, at all. Path policy has to come from mount namespaces or Landlock. This single constraint explains most of the design of every sandbox tool.
+    Arguments are visible as scalars only. The filter may not follow a <code>char *path</code>, because userspace could change that memory after the check and before the kernel uses it, a TOCTOU race. So <strong>"deny open() of /etc/shadow" is not expressible in a seccomp <em>filter</em></strong>. Path policy has to come from mount namespaces or Landlock.</p>
+    <p>One nuance the blanket version of this claim misses: a <code>USER_NOTIF</code> supervisor (5.0+) <em>can</em> mediate paths, by copying the argument out of <code>/proc/&lt;tid&gt;/mem</code> once, performing the operation on its own copy, and injecting the resulting fd with <code>SECCOMP_IOCTL_NOTIF_ADDFD</code>. Acting on the supervisor's copy has no TOCTOU. It is the <code>CONTINUE</code> pattern, check-then-let-it-proceed, that stays racy and that the man page says cannot implement a security policy. This is how runc and systemd emulate <code>mount</code>. This single constraint explains most of the design of every sandbox tool.
   </div>
 
   <h3 class="yl">The classic hand-rolled bug</h3>
-  <p>x86_64 kernels also accept i386 syscalls via <code>int 0x80</code>, where the numbers mean different things. A filter that checks the syscall number without first pinning the architecture can be walked straight around by issuing 32-bit calls. Check <code>arch</code> first, always. libseccomp inserts this for you; hand-written filters must not forget.</p>
+  <p>x86_64 kernels also accept i386 syscalls via <code>int 0x80</code>, where the numbers mean different things. A filter that checks the syscall number without first pinning the architecture can be walked straight around by issuing 32-bit calls. Check <code>arch</code> first, always. libseccomp inserts this for you; hand-written filters must not forget. And pinning the arch is still not sufficient for a <em>denylist</em> on x86_64: x32 syscalls report the same <code>AUDIT_ARCH_X86_64</code> and are distinguished only by <code>__X32_SYSCALL_BIT</code> (0x40000000) in <code>nr</code>, so a denylist that does not also reject that bit is bypassable. <code>man 2 seccomp</code> says so outright.</p>
 
   <pre class="yl"><span class="cm">/* arch must match, or kill. this is not optional. */</span>
 BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, <span class="key">arch</span>)),
@@ -688,7 +689,7 @@ BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, <span class="k
 
   <div class="info-box warn">
     <strong>Two policy lessons</strong>
-    <strong>Prefer ERRNO over KILL.</strong> Killing on an unexpected syscall means the next glibc update that calls something new turns a graceful degradation into a crash. <strong>Observation-derived profiles are incomplete.</strong> Trace a tool on benign input, capture its syscalls, ship the allowlist, and the first error path calls something unlisted and dies. This is exactly why Docker's default profile is a human-maintained <em>denylist</em> rather than a generated allowlist.
+    <strong>Prefer ERRNO over KILL.</strong> Killing on an unexpected syscall means the next glibc update that calls something new turns a graceful degradation into a crash. <strong>Observation-derived profiles are incomplete.</strong> Trace a tool on benign input, capture its syscalls, ship the allowlist, and the first error path calls something unlisted and dies. This is exactly why Docker's default profile is a <em>human-maintained</em> allowlist rather than a trace-generated one: it defaults to <code>SCMP_ACT_ERRNO</code> and names the roughly 300 syscalls it permits, leaving about 44 blocked. Curated by people watching kernel CVEs, not derived from a recording of one happy path.
   </div>
 </section>
 
@@ -746,7 +747,7 @@ BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, <span class="k
     <tr><td class="meth">firejail</td><td>all</td><td>built-in profiles</td><td>partial</td><td><strong>setuid</strong></td><td>batteries included, large profile library, setuid is its own attack surface</td></tr>
     <tr><td class="meth">nsjail</td><td>all</td><td>yes</td><td>yes</td><td>yes</td><td>Google. many knobs, verbose config, good for jails</td></tr>
     <tr><td class="meth">systemd-run</td><td>some</td><td><code>SystemCallFilter=</code></td><td><strong>yes</strong></td><td>yes</td><td>already installed. best cgroup story, weaker fs isolation</td></tr>
-    <tr><td class="meth">podman / docker</td><td>all</td><td>default denylist</td><td>yes</td><td>rootless: yes</td><td>heavy, but that default seccomp profile is genuinely good</td></tr>
+    <tr><td class="meth">podman / docker</td><td>all</td><td>curated allowlist</td><td>yes</td><td>rootless: yes</td><td>heavy, but that default seccomp profile is genuinely good</td></tr>
     <tr><td class="meth">gVisor</td><td>--</td><td>--</td><td>--</td><td>yes</td><td>userspace kernel. much smaller host surface, real perf cost</td></tr>
     <tr><td class="meth">firecracker / qemu</td><td>--</td><td>--</td><td>--</td><td>--</td><td>a real VM. the only honest answer for executing hostile code</td></tr>
   </table>
@@ -764,10 +765,10 @@ BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, <span class="k
   <p>None of these involve a kernel bug. All three defeat an otherwise correctly built sandbox, and all three are configuration mistakes people make constantly.</p>
 
   <h3 class="rd">1. D-Bus is a hole straight through everything</h3>
-  <p>Bind the session bus in for desktop-app compatibility and the sandboxed process can talk to host services. <code>org.freedesktop.Flatpak</code> will <strong>spawn a process on the host for you</strong>. Your namespaces, dropped capabilities and syscall filter are all intact and completely irrelevant, because you handed it an RPC channel to something privileged.</p>
+  <p>Bind the session bus in for desktop-app compatibility and the sandboxed process can talk to host services. The bus name <code>org.freedesktop.Flatpak</code> exposes <code>org.freedesktop.Flatpak.Development.HostCommand</code>, which <strong>runs a process on the host for you</strong>. That is exactly what <code>flatpak-spawn --host</code> calls (cf. CVE-2019-10063). Do not confuse it with <code>org.freedesktop.portal.Flatpak.Spawn</code>, a different service that by default spawns into another sandbox rather than onto the host. Your namespaces, dropped capabilities and syscall filter are all intact and completely irrelevant, because you handed it an RPC channel to something privileged.</p>
   <pre class="diagram rd">   sandbox <span class="dim">--(bind /run/user/1000/bus)--&gt;</span> session bus <span class="dim">--&gt;</span> <span class="acc">org.freedesktop.Flatpak</span>
                                                         <span class="dim">|</span>
-                                              <span class="acc">Spawn()</span> <span class="dim">-&gt; runs on the HOST</span>
+                                              <span class="acc">.Development.HostCommand()</span> <span class="dim">-&gt; runs on the HOST</span>
 
    fix: do not mount the bus. if unavoidable, front it with <span class="hi">xdg-dbus-proxy</span>
         and allowlist specific interfaces.</pre>
@@ -778,6 +779,7 @@ BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, offsetof(struct seccomp_data, <span class="k
 bwrap <span class="flag">--new-session</span> ...
 <span class="cm"># newer kernels can also disable it globally, but do not rely on it</span>
 sysctl dev.tty.legacy_tiocsti=0</pre>
+  <p>That framing is now out of date in the sandbox author's favour. Since Linux 6.2 <code>TIOCSTI</code> is gated behind <code>CAP_SYS_ADMIN</code> whenever <code>dev.tty.legacy_tiocsti=0</code>, and the build-time <code>CONFIG_LEGACY_TIOCSTI</code> sets that default. Upstream still defaults it on, but major distros ship it off, so on a current mainstream kernel this injection is already dead for unprivileged processes. Keep <code>--new-session</code> anyway: it costs nothing and covers older kernels and anyone who re-enabled the sysctl. (bwrap's own man page cites CVE-2017-5226 for it.)</p>
 
   <h3 class="rd">3. /proc without a pid namespace</h3>
   <p>Mounting a fresh <code>/proc</code> is not enough by itself. Without <code>--unshare-pid</code> it still shows host processes, so the sandbox reads <code>/proc/&lt;pid&gt;/environ</code> for secrets and <code>/proc/&lt;pid&gt;/fd/*</code> for open files. The two flags are a pair; either alone is a false sense of security.</p>

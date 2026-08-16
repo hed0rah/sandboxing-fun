@@ -16,7 +16,7 @@ independent primitives**, none of which was designed as a security boundary on i
 | capabilities | which of root's **powers** it holds | 2.2 |
 | seccomp-bpf | which **syscalls** it may issue | 3.5 |
 | cgroups v2 | how much **resource** it consumes | 4.5 |
-| Landlock | which **files** it may touch, unprivileged | 5.13 |
+| Landlock | which **files** it may touch, unprivileged (TCP ports too, since 6.7) | 5.13 |
 
 `bwrap`, `firejail`, `nsjail`, `podman` and `systemd` each wire some subset of those five
 together with different defaults. Read a `docker run` flag, a firejail profile line or a
@@ -80,6 +80,60 @@ Three deliberate design decisions, each of which came from the tool getting it w
   is an ephemeral tmpfs too. Both are writable, neither is an escape. Each write probe
   checks a sentinel (`/etc/passwd`, `/usr/bin`) to tell the host copy from the scaffold.
 
+### `nsview`
+
+Which namespaces is a process in, and are they its own?
+
+```sh
+./nsview                      # this process
+./nsview 1
+./nsview --compare 1 self
+bwrap ... /path/to/nsview     # run it INSIDE a sandbox to prove isolation
+```
+
+`/proc/<pid>/ns/<type>` reads `type:[inode]`, and two processes share a namespace exactly
+when the inode matches. The part that makes this a tool rather than a `readlink` is that
+the kernel gives each **initial** namespace a fixed, documented inode
+(`include/linux/ns_common.h`, `MNT_NS_INIT_INO` through `IPC_NS_INIT_INO`, `0xEFFFFFF8` to
+`0xEFFFFFFF`). A process can therefore decide entirely on its own, with nothing to compare
+against, whether it sits in the host's original namespace or one created for it.
+
+That matters because counting entries in `/proc` is a guess and an inode comparison is a
+fact. Pointed at a `bwrap --unshare-all` sandbox it reports 7 of 8 unshared, and names the
+one that is not: **`--unshare-all` does not include the time namespace.**
+
+### `capdecode`
+
+Decode a process's capability sets without libcap.
+
+```sh
+./capdecode            # this process
+./capdecode 1
+./capdecode --hex 00000000a80425fb     # docker's default set
+./capdecode --all      # every pid holding a capability
+```
+
+`capsh --decode` does this, but it ships in `libcap2-bin` / `libcap-progs` / `libcap` and is
+absent from exactly the minimal images where you are squinting at a raw `CapEff`. Output is
+byte-identical to `capsh` and runs under busybox ash.
+
+It prints all five sets, because the two that get quoted are the two that matter least:
+
+| set | meaning |
+|---|---|
+| `CapEff` | what the kernel checks right now |
+| `CapPrm` | what may be moved into Eff unaided |
+| `CapBnd` | the ceiling on `execve`. **This is what makes a drop stick** |
+| `CapInh` | what survives `execve` of a non-setuid binary |
+| `CapAmb` | Inh raised automatically, so it crosses a non-setuid exec |
+
+A sandbox reporting `CapEff=0` with a full bounding set has dropped nothing durable: a
+setuid binary or one carrying file capabilities raises them back on the next `execve`
+unless `no_new_privs` is also set. `capdecode` says so explicitly when it sees that shape,
+and flags the escape-grade capabilities (`sys_admin`, `sys_module`, `sys_rawio`,
+`sys_ptrace`, `dac_read_search`, `bpf`, `mknod`, and the rest) rather than printing forty
+names flat.
+
 ### `01_namespaces_by_hand.sh`
 
 The five namespaces, one at a time, with nothing but `util-linux`. No bwrap, no daemons, no
@@ -106,9 +160,22 @@ which is not beneath `/usr`. Landlock is working exactly as instructed. That is 
 cost of path policy, and the same incompleteness that makes observation-derived seccomp
 profiles unreliable.
 
+Then try a binary that *is* beneath the allowed path but dynamically linked. It still fails
+`execv: Permission denied`, because Landlock gates the **ELF interpreter** as well, and
+`/lib64/ld-linux-x86-64.so.2` is not under `/usr`. Static binaries run; dynamic ones need
+their loader and libraries inside the scope. This surprises people the first time and is
+the same lesson as `whoami` above, one layer down.
+
 The seccomp filter **pins the architecture before reading the syscall number**. Omit that
 and a 32-bit `int 0x80` call walks straight around a 64-bit filter. It is the classic
 hand-rolled seccomp bug.
+
+Pinning the arch is still not sufficient on x86_64, which is the subtler half. The **x32
+ABI reports the same `AUDIT_ARCH_X86_64`** but sets bit 30 (`__X32_SYSCALL_BIT`) in the
+syscall number, so x32 `ptrace` arrives as `0x40000065`, matches none of the numbers in the
+denylist, falls through every comparison and lands on `RET_ALLOW`. This file had that bug.
+The filter now rejects any `nr >= 0x40000000` outright. It is unreachable on kernels built
+without `CONFIG_X86_X32_ABI`, which is most of them now, and a complete bypass on the rest.
 
 ### `examples/agent-box.example`
 
@@ -130,11 +197,17 @@ still lands somewhere with nothing in it.
 
 None involve a kernel bug. All three defeat an otherwise correct sandbox.
 
-1. **D-Bus.** Bind the session bus in for compatibility and the sandbox can ask
-   `org.freedesktop.Flatpak` to spawn a process **on the host**. Namespaces, caps and
-   seccomp all intact and all irrelevant. Use `xdg-dbus-proxy` or do not mount the bus.
+1. **D-Bus.** Bind the session bus in for compatibility and the sandbox can call
+   `org.freedesktop.Flatpak.Development.HostCommand` to run a process **on the host**.
+   That is what `flatpak-spawn --host` uses (cf. CVE-2019-10063). Namespaces, caps and
+   seccomp all intact and all irrelevant. Note this is not the same as
+   `org.freedesktop.portal.Flatpak.Spawn`, which by default spawns into another sandbox.
+   Use `xdg-dbus-proxy` or do not mount the bus.
 2. **TIOCSTI.** A process sharing your pty can inject characters into the parent shell's
-   input buffer, which run as you afterwards. Fix: a fresh session.
+   input buffer, which run as you afterwards. Fix: a fresh session (`--new-session`,
+   which bwrap's man page ties to CVE-2017-5226). Since 6.2 the `dev.tty.legacy_tiocsti`
+   sysctl gates the ioctl behind `CAP_SYS_ADMIN`, and mainstream distros now ship it off,
+   so on a current kernel this is already dead. Keep `--new-session` for the older ones.
 3. **`/proc` without a pid namespace.** A fresh `/proc` alone still lists host processes,
    so the sandbox reads `/proc/<pid>/environ` for secrets. The two flags are a pair.
 
